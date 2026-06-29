@@ -205,7 +205,7 @@ app.post<{ Body: LoginRequestBody }>("/login", async (request, reply): Promise<L
     return { ok: false, message: "email is required" };
   }
 
-  if (config.inviteCode && inviteCode !== config.inviteCode) {
+  if (config.inviteCode && inviteCode !== config.inviteCode.trim()) {
     reply.code(401);
     return { ok: false, message: "invalid invite code" };
   }
