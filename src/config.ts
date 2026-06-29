@@ -1,5 +1,5 @@
 type GatewayConfig = {
-  port: number;
+  httpPort: number;
   appName: string;
   authSecret: string;
   inviteCode: string;
@@ -8,7 +8,7 @@ type GatewayConfig = {
 };
 
 export const config: GatewayConfig = {
-  port: Number(process.env.PORT ?? 8080),
+  httpPort: Number(process.env.HTTP_PORT ?? 8080),
   appName: process.env.APP_NAME ?? "GSM-VPN Gateway",
   authSecret: process.env.AUTH_SECRET ?? "dev-only-auth-secret-change-me",
   inviteCode: process.env.INVITE_CODE ?? "",

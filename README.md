@@ -17,6 +17,7 @@ Handles login, VPN server registration, server selection, peer registration, and
 - `AUTH_SECRET`
 - `INVITE_CODE`
 - `GATEWAY_SHARED_SECRET`
+- `HTTP_PORT`
 - `GATEWAY_STATE_FILE` if you want a custom state path
 
 ## Run

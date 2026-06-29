@@ -2,8 +2,10 @@ export type ServerStatus = {
   id: string;
   name: string;
   ip: string;
-  udpPort: number;
-  tcpPort: number;
+  internalUdpPort: number;
+  externalUdpPort: number;
+  httpPort: number;
+  externalHttpPort: number;
   managementUrl: string;
   endpoint: string;
   loadPercent: number;
@@ -14,15 +16,18 @@ export type ServerStatus = {
 
 export type VpnServerRegisterRequest = {
   ip?: string;
-  udpPort?: number;
-  tcpPort?: number;
+  internalUdpPort?: number;
+  externalUdpPort?: number;
+  httpPort?: number;
+  externalHttpPort?: number;
   name?: string;
 };
 
 export type VpnServerInfoUpdate = {
   ip?: string;
-  udpPort?: number;
-  tcpPort?: number;
+  internalUdpPort?: number;
+  httpPort?: number;
+  externalHttpPort?: number;
   name?: string;
   loadPercent?: number;
   online?: boolean;

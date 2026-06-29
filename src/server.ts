@@ -77,8 +77,10 @@ function toPublicServerStatus(server: VpnServerRecord): ServerStatus {
     id: server.id,
     name: server.name,
     ip: server.ip,
-    udpPort: server.udpPort,
-    tcpPort: server.tcpPort,
+    internalUdpPort: server.internalUdpPort,
+    externalUdpPort: server.externalUdpPort,
+    httpPort: server.httpPort,
+    externalHttpPort: server.externalHttpPort,
     managementUrl: server.managementUrl,
     endpoint: server.endpoint,
     loadPercent: server.loadPercent,
@@ -195,21 +197,23 @@ function readPeerAuthHeaders(request: { headers: IncomingHttpHeaders }): {
 
 function pickExistingServer(request: VpnServerRegisterRequest): VpnServerRecord | undefined {
   const ip = request.ip?.trim();
-  const udpPort = request.udpPort;
-  const tcpPort = request.tcpPort;
-  if (!ip || typeof udpPort !== "number" || typeof tcpPort !== "number") {
+  const internalUdpPort = request.internalUdpPort;
+  const httpPort = request.httpPort;
+  if (!ip || typeof internalUdpPort !== "number" || typeof httpPort !== "number") {
     return undefined;
   }
 
   return [...vpnServersById.values()].find(
-    (server) => server.ip === ip && server.udpPort === udpPort && server.tcpPort === tcpPort
+    (server) => server.ip === ip && server.internalUdpPort === internalUdpPort && server.httpPort === httpPort
   );
 }
 
 function upsertVpnServer(request: VpnServerRegisterRequest, wsKey: string): VpnServerRecord {
   const ip = request.ip?.trim() || "127.0.0.1";
-  const udpPort = Number(request.udpPort ?? 0);
-  const tcpPort = Number(request.tcpPort ?? 0);
+  const internalUdpPort = Number(request.internalUdpPort ?? 0);
+  const externalUdpPort = Number(request.externalUdpPort ?? request.internalUdpPort ?? 0);
+  const httpPort = Number(request.httpPort ?? 0);
+  const externalHttpPort = Number(request.externalHttpPort ?? request.httpPort ?? 0);
   const existing = pickExistingServer(request);
   const existingNames = new Set(
     [...vpnServersById.values()]
@@ -224,10 +228,12 @@ function upsertVpnServer(request: VpnServerRegisterRequest, wsKey: string): VpnS
     socket: existing?.socket ?? null,
     name,
     ip,
-    udpPort,
-    tcpPort,
-    managementUrl: buildManagementUrl(ip, tcpPort),
-    endpoint: buildEndpoint(ip, udpPort),
+    internalUdpPort,
+    externalUdpPort,
+    httpPort,
+    externalHttpPort,
+    managementUrl: buildManagementUrl(ip, externalHttpPort),
+    endpoint: buildEndpoint(ip, externalUdpPort),
     loadPercent: existing?.loadPercent ?? 0,
     online: existing?.online ?? false,
     publicKey: existing?.publicKey ?? "",
@@ -246,8 +252,17 @@ function upsertVpnServer(request: VpnServerRegisterRequest, wsKey: string): VpnS
 
 function mergeServerInfo(server: VpnServerRecord, update: VpnServerInfoPayload): VpnServerRecord {
   const nextIp = update.ip?.trim() || server.ip;
-  const nextUdpPort = typeof update.udpPort === "number" ? update.udpPort : server.udpPort;
-  const nextTcpPort = typeof update.tcpPort === "number" ? update.tcpPort : server.tcpPort;
+  const nextInternalUdpPort =
+    typeof update.internalUdpPort === "number" ? update.internalUdpPort : server.internalUdpPort;
+  const nextPublicUdpPort =
+    typeof (update as VpnServerRegisterRequest).externalUdpPort === "number"
+      ? (update as VpnServerRegisterRequest).externalUdpPort!
+      : server.externalUdpPort;
+  const nextHttpPort = typeof update.httpPort === "number" ? update.httpPort : server.httpPort;
+  const nextPublicTcpPort =
+    typeof (update as VpnServerRegisterRequest).externalHttpPort === "number"
+      ? (update as VpnServerRegisterRequest).externalHttpPort!
+      : server.externalHttpPort;
   const nextName = update.name?.trim() || server.name;
   const existingNames = new Set(
     [...vpnServersById.values()]
@@ -259,10 +274,12 @@ function mergeServerInfo(server: VpnServerRecord, update: VpnServerInfoPayload):
     ...server,
     name: normalizedName,
     ip: nextIp,
-    udpPort: nextUdpPort,
-    tcpPort: nextTcpPort,
-    managementUrl: buildManagementUrl(nextIp, nextTcpPort),
-    endpoint: buildEndpoint(nextIp, nextUdpPort),
+    internalUdpPort: nextInternalUdpPort,
+    externalUdpPort: nextPublicUdpPort,
+    httpPort: nextHttpPort,
+    externalHttpPort: nextPublicTcpPort,
+    managementUrl: buildManagementUrl(nextIp, nextPublicTcpPort),
+    endpoint: buildEndpoint(nextIp, nextPublicUdpPort),
     loadPercent: typeof update.loadPercent === "number" ? update.loadPercent : server.loadPercent,
     online: typeof update.online === "boolean" ? update.online : true,
     publicKey: typeof update.publicKey === "string" ? update.publicKey : server.publicKey,
@@ -456,8 +473,8 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
   }
 
   const ip = request.body.ip?.trim();
-  const udpPort = request.body.udpPort;
-  const tcpPort = request.body.tcpPort;
+  const internalUdpPort = request.body.internalUdpPort;
+  const httpPort = request.body.httpPort;
   const name = request.body.name?.trim();
 
   if (!ip) {
@@ -465,9 +482,9 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
     return { ok: false, message: "ip is required" };
   }
 
-  if (typeof udpPort !== "number" || typeof tcpPort !== "number") {
+  if (typeof internalUdpPort !== "number" || typeof httpPort !== "number") {
     reply.code(400);
-    return { ok: false, message: "udpPort and tcpPort are required" };
+    return { ok: false, message: "internalUdpPort and httpPort are required" };
   }
 
   if (!name) {
@@ -475,11 +492,17 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
     return { ok: false, message: "name is required" };
   }
 
+  const externalUdpPort =
+    typeof request.body.externalUdpPort === "number" ? request.body.externalUdpPort : internalUdpPort;
+  const externalHttpPort = typeof request.body.externalHttpPort === "number" ? request.body.externalHttpPort : httpPort;
+
   const signatureOk = createGatewayRequestSignature(config.gatewaySharedSecret, [
     auth.timestamp,
     ip,
-    String(udpPort),
-    String(tcpPort),
+    String(internalUdpPort),
+    String(externalUdpPort),
+    String(httpPort),
+    String(externalHttpPort),
     name,
   ]);
 
@@ -490,7 +513,10 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
   }
 
   const wsKey = randomUUID();
-  const server = upsertVpnServer({ ip, udpPort, tcpPort, name }, wsKey);
+  const server = upsertVpnServer(
+    { ip, internalUdpPort, externalUdpPort, httpPort, externalHttpPort, name },
+    wsKey
+  );
 
   return {
     ok: true,
@@ -688,7 +714,7 @@ app.post("/disconnect", async (request, reply): Promise<{ ok: true; message: str
 const start = async (): Promise<void> => {
   try {
     await loadPersistedLeases();
-    await app.listen({ port: config.port, host: "0.0.0.0" });
+    await app.listen({ port: config.httpPort, host: "0.0.0.0" });
   } catch (error) {
     app.log.error(error);
     process.exit(1);
