@@ -1,8 +1,11 @@
+import websocket from "@fastify/websocket";
 import Fastify from "fastify";
+import type { FastifyRequest } from "fastify";
 import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import WebSocket, { type RawData } from "ws";
 import { config } from "./config.js";
 import {
   createGatewayRequestSignature,
@@ -17,9 +20,10 @@ import type {
   LoginRequestBody,
   SelectServerResult,
   ServerStatus,
+  VpnServerInfoUpdate,
+  VpnServerRegisterRequest,
+  VpnServerRegisterResponse,
 } from "./types.js";
-
-const app = Fastify({ logger: true });
 
 type ClientLease = {
   clientAddress: string;
@@ -27,52 +31,73 @@ type ClientLease = {
   serverId: string;
 };
 
+type VpnServerRecord = ServerStatus & {
+  wsKey: string;
+  socket: WebSocket | null;
+};
+
+type VpnServerInfoPayload = VpnServerInfoUpdate & {
+  id?: string;
+};
+
+const app = Fastify({ logger: true });
+
 const clientLeases = new Map<string, ClientLease>();
 const persistedLeases = new Map<string, ClientLease>();
+const vpnServersById = new Map<string, VpnServerRecord>();
+const vpnServerIdsByWsKey = new Map<string, string>();
 const stateFilePath = path.resolve(config.stateFilePath);
 
-const servers: ReadonlyArray<ServerStatus> = [
-  {
-    id: "vpn-a",
-    name: "VPN Server A",
-    region: "primary",
-    loadPercent: 32,
-    online: true,
-    endpoint: config.vpnServerAUrl || "http://127.0.0.1:8081",
-    publicKey: "",
-  },
-  {
-    id: "vpn-b",
-    name: "VPN Server B",
-    region: "backup",
-    loadPercent: 18,
-    online: true,
-    endpoint: config.vpnServerBUrl || "http://127.0.0.1:8082",
-    publicKey: "",
-  },
-];
-
-async function refreshServerStatus(server: ServerStatus): Promise<ServerStatus> {
-  try {
-    const response = await fetch(`${server.endpoint}/status`);
-    if (!response.ok) {
-      return server;
-    }
-
-    const data = (await response.json()) as Partial<ServerStatus>;
-    return {
-      ...server,
-      online: data.online ?? server.online,
-      loadPercent: typeof data.loadPercent === "number" ? data.loadPercent : server.loadPercent,
-      publicKey: typeof data.publicKey === "string" ? data.publicKey : server.publicKey,
-    };
-  } catch {
-    return server;
+function normalizeName(baseName: string, existingNames: ReadonlySet<string>): string {
+  const trimmed = baseName.trim() || "VPN Server";
+  if (!existingNames.has(trimmed)) {
+    return trimmed;
   }
+
+  for (let suffix = 1; suffix < 1000; suffix += 1) {
+    const candidate = `${trimmed}-${String(suffix).padStart(2, "0")}`;
+    if (!existingNames.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error("No available server names");
+}
+
+function buildManagementUrl(ip: string, tcpPort: number): string {
+  return `http://${ip}:${tcpPort}`;
+}
+
+function buildEndpoint(ip: string, udpPort: number): string {
+  return `${ip}:${udpPort}`;
+}
+
+function toPublicServerStatus(server: VpnServerRecord): ServerStatus {
+  return {
+    id: server.id,
+    name: server.name,
+    ip: server.ip,
+    udpPort: server.udpPort,
+    tcpPort: server.tcpPort,
+    managementUrl: server.managementUrl,
+    endpoint: server.endpoint,
+    loadPercent: server.loadPercent,
+    online: server.online,
+    publicKey: server.publicKey,
+    lastSeenAt: server.lastSeenAt,
+  };
+}
+
+function listServers(): ServerStatus[] {
+  return [...vpnServersById.values()]
+    .map(toPublicServerStatus)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function selectBestServer(serverList: ReadonlyArray<ServerStatus>): ServerStatus | undefined {
-  return [...serverList].filter((server) => server.online).sort((a, b) => a.loadPercent - b.loadPercent)[0];
+  return [...serverList]
+    .filter((server) => server.online)
+    .sort((a, b) => a.loadPercent - b.loadPercent || a.name.localeCompare(b.name))[0];
 }
 
 function allocateClientAddress(): string {
@@ -108,27 +133,173 @@ async function loadPersistedLeases(): Promise<void> {
 async function savePersistedLeases(): Promise<void> {
   await mkdir(path.dirname(stateFilePath), { recursive: true });
   const payload = Object.fromEntries(clientLeases);
-  await writeFile(stateFilePath, JSON.stringify({ leases: { ...Object.fromEntries(persistedLeases), ...payload } }, null, 2), "utf8");
+  await writeFile(
+    stateFilePath,
+    JSON.stringify({ leases: { ...Object.fromEntries(persistedLeases), ...payload } }, null, 2),
+    "utf8"
+  );
 }
 
-async function removePeerFromServer(server: ServerStatus, deviceId: string, peerPublicKey: string): Promise<void> {
-  const timestamp = Date.now().toString();
-  const gatewaySignature = createGatewayRequestSignature(config.gatewaySharedSecret, [
-    timestamp,
-    server.id,
-    peerPublicKey,
-    deviceId,
-  ]);
+function readHeader(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name.toLowerCase()];
+  return Array.isArray(value) ? value[0] : value;
+}
 
-  await fetch(`${server.endpoint}/peers/${encodeURIComponent(peerPublicKey)}`, {
-    method: "DELETE",
-    headers: {
-      "x-gateway-timestamp": timestamp,
-      "x-gateway-signature": gatewaySignature,
-      "x-gateway-device-id": deviceId,
-      "x-gateway-server-id": server.id,
-    },
-  });
+function readGatewayAuthHeaders(request: { headers: IncomingHttpHeaders }): {
+  signature: string;
+  timestamp: string;
+} | null {
+  const signature = readHeader(request.headers, "x-gateway-signature");
+  const timestamp = readHeader(request.headers, "x-gateway-timestamp");
+  if (!signature || !timestamp) {
+    return null;
+  }
+
+  const parsed = Number(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  if (Math.abs(Date.now() - parsed) > 5 * 60 * 1000) {
+    return null;
+  }
+
+  return { signature, timestamp };
+}
+
+function readPeerAuthHeaders(request: { headers: IncomingHttpHeaders }): {
+  deviceId: string;
+  signature: string;
+  serverId: string;
+  timestamp: string;
+} | null {
+  const deviceId = readHeader(request.headers, "x-gateway-device-id");
+  const signature = readHeader(request.headers, "x-gateway-signature");
+  const serverId = readHeader(request.headers, "x-gateway-server-id");
+  const timestamp = readHeader(request.headers, "x-gateway-timestamp");
+  if (!deviceId || !signature || !serverId || !timestamp) {
+    return null;
+  }
+
+  const parsed = Number(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  if (Math.abs(Date.now() - parsed) > 5 * 60 * 1000) {
+    return null;
+  }
+
+  return { deviceId, signature, serverId, timestamp };
+}
+
+function pickExistingServer(request: VpnServerRegisterRequest): VpnServerRecord | undefined {
+  const ip = request.ip?.trim();
+  const udpPort = request.udpPort;
+  const tcpPort = request.tcpPort;
+  if (!ip || typeof udpPort !== "number" || typeof tcpPort !== "number") {
+    return undefined;
+  }
+
+  return [...vpnServersById.values()].find(
+    (server) => server.ip === ip && server.udpPort === udpPort && server.tcpPort === tcpPort
+  );
+}
+
+function upsertVpnServer(request: VpnServerRegisterRequest, wsKey: string): VpnServerRecord {
+  const ip = request.ip?.trim() || "127.0.0.1";
+  const udpPort = Number(request.udpPort ?? 0);
+  const tcpPort = Number(request.tcpPort ?? 0);
+  const existing = pickExistingServer(request);
+  const existingNames = new Set(
+    [...vpnServersById.values()]
+      .filter((server) => server.id !== existing?.id)
+      .map((server) => server.name)
+  );
+  const name = normalizeName(request.name?.trim() || existing?.name || "VPN Server", existingNames);
+  const id = existing?.id ?? randomUUID();
+  const baseRecord: VpnServerRecord = {
+    id,
+    wsKey,
+    socket: existing?.socket ?? null,
+    name,
+    ip,
+    udpPort,
+    tcpPort,
+    managementUrl: buildManagementUrl(ip, tcpPort),
+    endpoint: buildEndpoint(ip, udpPort),
+    loadPercent: existing?.loadPercent ?? 0,
+    online: existing?.online ?? false,
+    publicKey: existing?.publicKey ?? "",
+    lastSeenAt: existing?.lastSeenAt ?? null,
+  };
+
+  vpnServersById.set(id, baseRecord);
+  vpnServerIdsByWsKey.set(wsKey, id);
+
+  if (existing && existing.wsKey !== wsKey) {
+    vpnServerIdsByWsKey.delete(existing.wsKey);
+  }
+
+  return baseRecord;
+}
+
+function mergeServerInfo(server: VpnServerRecord, update: VpnServerInfoPayload): VpnServerRecord {
+  const nextIp = update.ip?.trim() || server.ip;
+  const nextUdpPort = typeof update.udpPort === "number" ? update.udpPort : server.udpPort;
+  const nextTcpPort = typeof update.tcpPort === "number" ? update.tcpPort : server.tcpPort;
+  const nextName = update.name?.trim() || server.name;
+  const existingNames = new Set(
+    [...vpnServersById.values()]
+      .filter((candidate) => candidate.id !== server.id)
+      .map((candidate) => candidate.name)
+  );
+  const normalizedName = normalizeName(nextName, existingNames);
+  const merged: VpnServerRecord = {
+    ...server,
+    name: normalizedName,
+    ip: nextIp,
+    udpPort: nextUdpPort,
+    tcpPort: nextTcpPort,
+    managementUrl: buildManagementUrl(nextIp, nextTcpPort),
+    endpoint: buildEndpoint(nextIp, nextUdpPort),
+    loadPercent: typeof update.loadPercent === "number" ? update.loadPercent : server.loadPercent,
+    online: typeof update.online === "boolean" ? update.online : true,
+    publicKey: typeof update.publicKey === "string" ? update.publicKey : server.publicKey,
+    lastSeenAt: new Date().toISOString(),
+  };
+
+  vpnServersById.set(server.id, merged);
+  return merged;
+}
+
+function readInfoPayload(raw: string): VpnServerInfoPayload | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    if ("server" in parsed && parsed.server && typeof parsed.server === "object") {
+      return parsed.server as VpnServerInfoPayload;
+    }
+
+    return parsed as VpnServerInfoPayload;
+  } catch {
+    return null;
+  }
+}
+
+function rawDataToString(message: RawData): string {
+  if (typeof message === "string") {
+    return message;
+  }
+
+  if (Array.isArray(message)) {
+    return Buffer.concat(message).toString("utf8");
+  }
+
+  return Buffer.isBuffer(message) ? message.toString("utf8") : Buffer.from(message).toString("utf8");
 }
 
 async function registerPeerOnServer(
@@ -145,7 +316,7 @@ async function registerPeerOnServer(
     deviceId,
   ]);
 
-  const response = await fetch(`${server.endpoint}/peers/register`, {
+  const response = await fetch(`${server.managementUrl}/peers/register`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -165,9 +336,24 @@ async function registerPeerOnServer(
   return response.ok;
 }
 
-function readHeader(headers: IncomingHttpHeaders, name: string): string | undefined {
-  const value = headers[name.toLowerCase()];
-  return Array.isArray(value) ? value[0] : value;
+async function removePeerFromServer(server: ServerStatus, deviceId: string, peerPublicKey: string): Promise<void> {
+  const timestamp = Date.now().toString();
+  const gatewaySignature = createGatewayRequestSignature(config.gatewaySharedSecret, [
+    timestamp,
+    server.id,
+    peerPublicKey,
+    deviceId,
+  ]);
+
+  await fetch(`${server.managementUrl}/peers/${encodeURIComponent(peerPublicKey)}`, {
+    method: "DELETE",
+    headers: {
+      "x-gateway-timestamp": timestamp,
+      "x-gateway-signature": gatewaySignature,
+      "x-gateway-device-id": deviceId,
+      "x-gateway-server-id": server.id,
+    },
+  });
 }
 
 async function requireAuth(request: { headers: IncomingHttpHeaders }): Promise<GatewayAuthContext | null> {
@@ -187,6 +373,24 @@ async function requireAuth(request: { headers: IncomingHttpHeaders }): Promise<G
     deviceId: payload.deviceId,
   };
 }
+
+function getServerById(serverId: string | undefined): VpnServerRecord | undefined {
+  if (!serverId) {
+    return undefined;
+  }
+
+  return vpnServersById.get(serverId);
+}
+
+async function publishServerState(socket: WebSocket, server: VpnServerRecord): Promise<void> {
+  if (socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  socket.send(JSON.stringify({ ok: true, server: toPublicServerStatus(server) }));
+}
+
+app.register(websocket);
 
 app.get("/health", async (): Promise<{ ok: true; app: string }> => {
   return {
@@ -241,9 +445,118 @@ app.get("/servers", async (request, reply): Promise<{ servers: ServerStatus[] } 
     return { ok: false, message: "unauthorized" };
   }
 
-  const refreshed = await Promise.all(servers.map((server) => refreshServerStatus(server)));
-  return { servers: refreshed };
+  return { servers: listServers() };
 });
+
+app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, reply): Promise<VpnServerRegisterResponse> => {
+  const auth = readGatewayAuthHeaders(request);
+  if (!auth) {
+    reply.code(401);
+    return { ok: false, message: "unauthorized" };
+  }
+
+  const ip = request.body.ip?.trim();
+  const udpPort = request.body.udpPort;
+  const tcpPort = request.body.tcpPort;
+  const name = request.body.name?.trim();
+
+  if (!ip) {
+    reply.code(400);
+    return { ok: false, message: "ip is required" };
+  }
+
+  if (typeof udpPort !== "number" || typeof tcpPort !== "number") {
+    reply.code(400);
+    return { ok: false, message: "udpPort and tcpPort are required" };
+  }
+
+  if (!name) {
+    reply.code(400);
+    return { ok: false, message: "name is required" };
+  }
+
+  const signatureOk = createGatewayRequestSignature(config.gatewaySharedSecret, [
+    auth.timestamp,
+    ip,
+    String(udpPort),
+    String(tcpPort),
+    name,
+  ]);
+
+  const headerSignature = readHeader(request.headers, "x-gateway-signature") ?? "";
+  if (signatureOk !== headerSignature) {
+    reply.code(401);
+    return { ok: false, message: "invalid gateway signature" };
+  }
+
+  const wsKey = randomUUID();
+  const server = upsertVpnServer({ ip, udpPort, tcpPort, name }, wsKey);
+
+  return {
+    ok: true,
+    message: "VPN server registered",
+    wsKey,
+    server: toPublicServerStatus(server),
+  };
+});
+
+app.get<{ Querystring: { wsKey?: string } }>(
+  "/vpn/info",
+  { websocket: true },
+  (connection: { socket: WebSocket }, request: FastifyRequest<{ Querystring: { wsKey?: string } }>) => {
+    const wsKey = request.query.wsKey?.trim();
+    const serverId = wsKey ? vpnServerIdsByWsKey.get(wsKey) : undefined;
+    const server = getServerById(serverId);
+
+    if (!server || server.wsKey !== wsKey) {
+      connection.socket.close(1008, "invalid wsKey");
+      return;
+    }
+
+    if (server.socket && server.socket !== connection.socket && server.socket.readyState === WebSocket.OPEN) {
+      server.socket.close(1000, "replaced");
+    }
+
+    const nextServer: VpnServerRecord = {
+      ...server,
+      socket: connection.socket,
+      online: true,
+      lastSeenAt: new Date().toISOString(),
+    };
+    vpnServersById.set(server.id, nextServer);
+
+    void publishServerState(connection.socket, nextServer);
+
+    connection.socket.on("message", (message: RawData) => {
+      const payload = readInfoPayload(rawDataToString(message));
+      if (!payload) {
+        return;
+      }
+
+      const current = vpnServersById.get(server.id);
+      if (!current) {
+        return;
+      }
+
+      const updated = mergeServerInfo(current, payload);
+      void publishServerState(connection.socket, updated);
+    });
+
+    connection.socket.on("close", () => {
+      const current = vpnServersById.get(server.id);
+      if (!current || current.socket !== connection.socket) {
+        return;
+      }
+
+      vpnServersById.set(server.id, {
+        ...current,
+        socket: null,
+        online: false,
+        lastSeenAt: new Date().toISOString(),
+      });
+    });
+  }
+);
 
 app.post<{ Body: ConnectRequestBody }>("/connect", async (request, reply) => {
   const auth = await requireAuth(request);
@@ -252,10 +565,10 @@ app.post<{ Body: ConnectRequestBody }>("/connect", async (request, reply) => {
     return { ok: false, message: "unauthorized" };
   }
 
-  const refreshed: ServerStatus[] = await Promise.all(servers.map((server) => refreshServerStatus(server)));
+  const servers = listServers();
   const selected: ServerStatus | undefined = request.body.serverId
-    ? refreshed.find((server) => server.id === request.body.serverId && server.online)
-    : selectBestServer(refreshed);
+    ? servers.find((server) => server.id === request.body.serverId && server.online)
+    : selectBestServer(servers);
 
   if (!selected) {
     return {
@@ -287,7 +600,7 @@ app.post<{ Body: ConnectRequestBody }>("/connect", async (request, reply) => {
 
   const leaseToCleanup = existingLease ?? persistedLease;
   if (leaseToCleanup) {
-    const previousServer = refreshed.find((server) => server.id === leaseToCleanup.serverId);
+    const previousServer = vpnServersById.get(leaseToCleanup.serverId);
     if (previousServer) {
       try {
         await removePeerFromServer(previousServer, auth.deviceId, leaseToCleanup.peerPublicKey);
@@ -353,8 +666,7 @@ app.post("/disconnect", async (request, reply): Promise<{ ok: true; message: str
 
   const lease = clientLeases.get(auth.deviceId);
   if (lease) {
-    const refreshed = await Promise.all(servers.map((server) => refreshServerStatus(server)));
-    const server = refreshed.find((candidate) => candidate.id === lease.serverId);
+    const server = vpnServersById.get(lease.serverId);
     if (server) {
       try {
         await removePeerFromServer(server, auth.deviceId, lease.peerPublicKey);

@@ -1,12 +1,44 @@
 export type ServerStatus = {
   id: string;
   name: string;
-  region: string;
+  ip: string;
+  udpPort: number;
+  tcpPort: number;
+  managementUrl: string;
+  endpoint: string;
   loadPercent: number;
   online: boolean;
-  endpoint: string;
   publicKey: string;
+  lastSeenAt: string | null;
 };
+
+export type VpnServerRegisterRequest = {
+  ip?: string;
+  udpPort?: number;
+  tcpPort?: number;
+  name?: string;
+};
+
+export type VpnServerInfoUpdate = {
+  ip?: string;
+  udpPort?: number;
+  tcpPort?: number;
+  name?: string;
+  loadPercent?: number;
+  online?: boolean;
+  publicKey?: string;
+  peers?: Array<{
+    publicKey: string;
+    allowedIps: string[];
+    lastHandshakeAt: string | null;
+    rxBytes: number;
+    txBytes: number;
+  }>;
+};
+
+export type VpnServerRegisterResponse =
+  | { ok: true; message: string; wsKey: string; server: ServerStatus }
+  | { ok: false; message: string };
 
 export type ConnectResponse = {
   serverId: string;
