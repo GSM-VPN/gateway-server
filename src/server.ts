@@ -503,31 +503,31 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
 app.get<{ Querystring: { wsKey?: string } }>(
   "/vpn/info",
   { websocket: true },
-  (connection: { socket: WebSocket }, request: FastifyRequest<{ Querystring: { wsKey?: string } }>) => {
+  (socket: WebSocket, request: FastifyRequest<{ Querystring: { wsKey?: string } }>) => {
     const wsKey = request.query.wsKey?.trim();
     const serverId = wsKey ? vpnServerIdsByWsKey.get(wsKey) : undefined;
     const server = getServerById(serverId);
 
     if (!server || server.wsKey !== wsKey) {
-      connection.socket.close(1008, "invalid wsKey");
+      socket.close(1008, "invalid wsKey");
       return;
     }
 
-    if (server.socket && server.socket !== connection.socket && server.socket.readyState === WebSocket.OPEN) {
+    if (server.socket && server.socket !== socket && server.socket.readyState === WebSocket.OPEN) {
       server.socket.close(1000, "replaced");
     }
 
     const nextServer: VpnServerRecord = {
       ...server,
-      socket: connection.socket,
+      socket,
       online: true,
       lastSeenAt: new Date().toISOString(),
     };
     vpnServersById.set(server.id, nextServer);
 
-    void publishServerState(connection.socket, nextServer);
+    void publishServerState(socket, nextServer);
 
-    connection.socket.on("message", (message: RawData) => {
+    socket.on("message", (message: RawData) => {
       const payload = readInfoPayload(rawDataToString(message));
       if (!payload) {
         return;
@@ -539,12 +539,12 @@ app.get<{ Querystring: { wsKey?: string } }>(
       }
 
       const updated = mergeServerInfo(current, payload);
-      void publishServerState(connection.socket, updated);
+      void publishServerState(socket, updated);
     });
 
-    connection.socket.on("close", () => {
+    socket.on("close", () => {
       const current = vpnServersById.get(server.id);
-      if (!current || current.socket !== connection.socket) {
+      if (!current || current.socket !== socket) {
         return;
       }
 
