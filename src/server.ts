@@ -529,7 +529,11 @@ app.post<{ Body: VpnServerRegisterRequest }>("/vpn/register", async (request, re
 app.get<{ Querystring: { wsKey?: string } }>(
   "/vpn/info",
   { websocket: true },
-  (socket: WebSocket, request: FastifyRequest<{ Querystring: { wsKey?: string } }>) => {
+  (
+    connection: WebSocket | { socket: WebSocket },
+    request: FastifyRequest<{ Querystring: { wsKey?: string } }>
+  ) => {
+    const socket = "socket" in connection ? connection.socket : connection;
     const wsKey = request.query.wsKey?.trim();
     const serverId = wsKey ? vpnServerIdsByWsKey.get(wsKey) : undefined;
     const server = getServerById(serverId);
